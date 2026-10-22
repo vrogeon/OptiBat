@@ -1,35 +1,85 @@
-# This is a sample Python script.
+"""Entry point: smart battery control on a Raspberry Pi.
 
+Usage:
+    export SOBRY_API_KEY=...                  # never hard-code it
+    python3 main.py --probe [config.json]         # read-only: TIC, battery, prices
+    python3 main.py --battery-test [config.json]  # ~40 s, 100 W charge/discharge test
+    python3 main.py --dry-run [config.json]       # plan + log, never touches the battery
+    python3 main.py [config.json]                 # live
+"""
+import logging
+import signal
+import sys
 import time
+from datetime import datetime
 
-import prices
-import battery
-import consumption
-import gateway
-
-power_value = 0
-
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    prices.get_price()
-
-    # battery.set_power(power_value)
-
-    while True:
-        # gateway.decode_teleinfo()
-        # current_sinst = get_sinst()
-        # if current_sinst is not None:
-        #     print(f"Puissance instantanée : {current_sinst} W")
-        #     if current_sinst == 0:
-        #         power_value = power_value - 10
-        #     else:
-        #         power_value = current_sinst + power_value
-        #     battery.set_power(power_value)
+import adapters
+from config import Config
+from controller import SmartController
 
 
-        time.sleep(1)  # Rafraîchissement toutes les secondes
+class DryRunIO:
+    """Wraps the real IO but only logs battery commands. The controller still
+    learns consumption and prices, so a few days of dry run is a safe way to
+    check forecasts and decisions (see the PLAN log lines) before going live."""
+    dry_run = True
+
+    def __init__(self, io):
+        self._io = io
+
+    def __getattr__(self, name):
+        return getattr(self._io, name)
+
+    def set_battery_power_w(self, watts):
+        logging.getLogger("smart").debug("DRY RUN: battery command %d W", watts)
 
 
+def main():
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    log = logging.getLogger("smart")
+
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    cfg = Config.from_file(args[0]) if args else Config()
+
+    if "--probe" in sys.argv:
+        adapters.probe(cfg)
+        return
+    if "--battery-test" in sys.argv:
+        adapters.battery_test(cfg)
+        return
+
+    io = adapters.HardwareIO(cfg)
+    io.startup_check()
+    if "--dry-run" in sys.argv:
+        io = DryRunIO(io)
+        log.info("DRY RUN: the battery will not be commanded")
+    ctl = SmartController(cfg, io)
+
+    # systemd sends SIGTERM: leave the loop cleanly so the battery is zeroed
+    # and the learned state is saved.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    log.info("smart battery controller started")
+    try:
+        while True:
+            t0 = time.monotonic()
+            try:
+                ctl.step(datetime.now())
+            except Exception:
+                log.exception("control step failed; battery set to idle")
+                try:
+                    io.set_battery_power_w(0)
+                except Exception:
+                    pass
+            time.sleep(max(0.0, cfg.control_period_s - (time.monotonic() - t0)))
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        ctl.shutdown()
+        io.close()
+        log.info("stopped")
 
 
-
+if __name__ == "__main__":
+    main()
