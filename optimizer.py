@@ -48,8 +48,15 @@ class Optimizer:
 
         kc = int(cfg.max_charge_w / 1000.0 * self.dt_h * cfg.eff_charge / self.step_kwh)
         kd = int(cfg.max_discharge_w / 1000.0 * self.dt_h / cfg.eff_discharge / self.step_kwh)
-        self.kc = max(1, kc)
-        self.kd = max(1, kd)
+        if kc < 1 or kd < 1:
+            # one SoC step would already exceed what the inverter can move in a
+            # slot: every planned action would break the power limit
+            raise ValueError(
+                "SoC step (%.0f Wh) is larger than the energy the battery can move "
+                "in one %d-min slot: lower soc_levels or raise max_*_w" % (
+                    self.step_kwh * 1000, cfg.slot_minutes))
+        self.kc = kc
+        self.kd = kd
 
         # actions: (d, ac_kwh, wear_eur). ac_kwh > 0: drawn from grid (charge),
         # < 0: delivered to the house (discharge). d = 0 first so ties -> idle.

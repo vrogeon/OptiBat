@@ -18,7 +18,8 @@ from dataclasses import dataclass, field, fields
 @dataclass
 class Config:
     # ---- planning grid ---------------------------------------------------
-    slot_minutes: int = 15          # must divide 60 (price granularity)
+    slot_minutes: int = 15          # MUST stay 15 = the Sobry price granularity
+                                    # (other values are rejected at start-up)
     horizon_slots: int = 96         # rolling horizon: 96 x 15 min = 24 h
     soc_levels: int = 41            # SoC discretisation of the optimiser
 
@@ -46,7 +47,7 @@ class Config:
     zendure_timeout_s: float = 3.0
 
     # ---- Linky TIC, standard mode (from your gateway.py) -----------------------
-    tic_port: str = "/dev/serial0"  # gateway.py has "COM5" (Windows); on the Pi use
+    tic_port: str = "COM5"  # gateway.py has "COM5" (Windows); on the Pi use
                                     # /dev/serial0, /dev/ttyAMA0 or /dev/ttyUSB0
     tic_baud: int = 9600
     tic_max_age_s: float = 10.0     # older SINSTS = "no data" -> fail-safe
@@ -93,6 +94,17 @@ class Config:
     # ---- persistence ------------------------------------------------------------
     state_path: str = "state.json"  # None disables persistence
     save_every_s: float = 1800.0    # SD-card friendly
+
+    def __post_init__(self):
+        if (self.slot_minutes != 15
+                or self.sobry_params.get("granularity", "15m") != "15m"):
+            raise ValueError(
+                "slot_minutes must be 15 with Sobry granularity '15m' (got "
+                "slot_minutes=%r, granularity=%r). Prices exist per 15 minutes: "
+                "shorter slots have no price of their own, the 24 h horizon "
+                "shrinks (96 x 1 min = 96 min) and the planner cannot see the "
+                "price peaks, so it never charges." % (
+                    self.slot_minutes, self.sobry_params.get("granularity", "15m")))
 
     @classmethod
     def from_file(cls, path):

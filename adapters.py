@@ -282,6 +282,15 @@ def parse_price_records(data, tz=None):
     pk = _first_key(recs[0], _PRICE_KEYS)
     out = [(_parse_time(r[tk], tz), float(r[pk])) for r in recs]
     out.sort()
+    # A time field that does not identify the slot (e.g. a date without the
+    # hour) would collapse all records onto one slot and leave the planner
+    # with a single price. (A few duplicates are legitimate on the day the
+    # clocks go back, hence the tolerance.)
+    if len({t for t, _ in out}) < 0.8 * len(out):
+        raise ValueError(
+            "%d records but only %d distinct timestamps: the time field %r does "
+            "not identify the slot. First record: %s" % (
+                len(out), len({t for t, _ in out}), tk, json.dumps(recs[0])[:300]))
     return out
 
 
@@ -395,6 +404,61 @@ def probe(cfg):
         print("   after price_scale/adder: min %.4f max %.4f (must be EUR/kWh)" % (min(vals), max(vals)))
     except Exception as exc:
         print("   failed:", exc)
+
+
+def show_plan(cfg):
+    """What the planner would do right now with the live prices, hour by hour.
+
+    Uses the real controller code but never sends anything to the battery.
+    """
+    from controller import SmartController
+
+    class _PlanIO:
+        grid_signed = False
+        dry_run = True
+
+        def __init__(self):
+            self.prices, self.bat = SobryPrices(cfg), ZendureBattery(cfg)
+
+        def read_grid_w(self):
+            return None
+
+        def get_soc(self):
+            try:
+                return self.bat.get_soc()
+            except Exception:
+                return None
+
+        def set_battery_power_w(self, w):
+            pass
+
+        def get_price_curve(self):
+            return self.prices.curve()
+
+    io = _PlanIO()
+    ctl = SmartController(cfg, io)
+    now = datetime.now()
+    slot = ctl._floor(now)
+    ctl._refresh_prices(now)
+    ctl._train_prices(slot)                 # as the real program does at each slot
+    soc = io.get_soc()
+    ctl.soc = soc if soc is not None else cfg.soc_initial
+    ctl._replan(slot)
+    print("\nSoC %.0f%% (%s); %d price slots published in the next 24 h" % (
+        ctl.soc * 100, "read from the battery" if soc is not None else "assumed",
+        sum(1 for i in range(cfg.horizon_slots)
+            if slot + timedelta(minutes=15 * i) in ctl.known_prices)))
+    print("%-6s %8s %-9s %10s %6s" % ("time", "EUR/kWh", "price", "battery W", "SoC"))
+    for h in range(24):
+        steps = ctl.plan.steps[h * 4:(h + 1) * 4]
+        t0 = slot + timedelta(minutes=60 * h)
+        pub = sum(1 for i in range(4) if t0 + timedelta(minutes=15 * i) in ctl.known_prices)
+        bw = sum(s.battery_w for s in steps) / 4.0
+        print("%-6s %8.3f %-9s %10.0f %5.0f%%  %s" % (
+            t0.strftime("%H:%M"), sum(s.price for s in steps) / 4.0,
+            "published" if pub == 4 else "forecast" if pub == 0 else "mixed", bw,
+            steps[-1].soc_end * 100,
+            "CHARGE" if bw < -20 else "discharge" if bw > 20 else ""))
 
 
 def battery_test(cfg):

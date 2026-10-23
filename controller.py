@@ -245,6 +245,19 @@ class SmartController:
             log.error("price outside -0.5..3 EUR/kWh: check price_scale "
                       "(is the API in c/kWh or EUR/MWh?). Fetch ignored.")
             return False
+        if not vals:
+            log.warning("price fetch returned no records")
+            return False
+        pv = [v for _, v in vals]
+        kmin, kmax = min(k for k, _ in vals), max(k for k, _ in vals)
+        n_slots = len({k for k, _ in vals})
+        log.info("prices fetched: %d records, %d distinct slots (%s -> %s), "
+                 "%.3f..%.3f EUR/kWh", len(vals), n_slots, kmin.strftime("%a %H:%M"),
+                 kmax.strftime("%a %H:%M"), min(pv), max(pv))
+        if n_slots < 0.5 * len(vals) or (len(pv) > 4 and max(pv) - min(pv) < 0.02):
+            log.warning("prices look wrong (duplicate timestamps or no spread at all): "
+                        "the planner will not charge. Run `python3 main.py --probe` "
+                        "and check the sample it prints.")
         changed = False
         for key, val in vals:
             if self.known_prices.get(key) != val:
@@ -275,12 +288,13 @@ class SmartController:
         tv = cfg.terminal_value_factor * sum(prices) / N
         self.plan = self.opt.solve(self.soc, prices, loads, tv)
         s0 = self.plan.steps[0]
-        log.info("PLAN %s soc %.0f%% -> %s %.0f W | horizon cost %.2f EUR "
-                 "(no battery %.2f) | %.0f ms", slot_start.strftime("%a %H:%M"),
-                 self.soc * 100,
+        known = sum(1 for t in slots if t in self.known_prices)
+        log.info("PLAN %s soc %.0f%% -> %s %.0f W | prices %.3f..%.3f (%d/%d published) "
+                 "| horizon cost %.2f EUR (no battery %.2f) | %.0f ms",
+                 slot_start.strftime("%a %H:%M"), self.soc * 100,
                  "charge" if s0.d > 0 else "discharge" if s0.d < 0 else "idle",
-                 abs(s0.battery_w), self.plan.cost_eur, self.plan.baseline_eur,
-                 self.plan.solve_ms)
+                 abs(s0.battery_w), min(prices), max(prices), known, N,
+                 self.plan.cost_eur, self.plan.baseline_eur, self.plan.solve_ms)
 
     # --------------------------------------------------------------- real time
     def _realtime_target(self, now, grid_w, load_w):

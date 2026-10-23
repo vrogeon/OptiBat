@@ -3,6 +3,7 @@
 Usage:
     export SOBRY_API_KEY=...                  # never hard-code it
     python3 main.py --probe [config.json]         # read-only: TIC, battery, prices
+    python3 main.py --plan [config.json]          # read-only: the 24 h plan with live prices
     python3 main.py --battery-test [config.json]  # ~40 s, 100 W charge/discharge test
     python3 main.py --dry-run [config.json]       # plan + log, never touches the battery
     python3 main.py [config.json]                 # live
@@ -44,6 +45,9 @@ def main():
 
     if "--probe" in sys.argv:
         adapters.probe(cfg)
+        return
+    if "--plan" in sys.argv:
+        adapters.show_plan(cfg)
         return
     if "--battery-test" in sys.argv:
         adapters.battery_test(cfg)
