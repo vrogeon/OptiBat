@@ -25,6 +25,7 @@ NOT verified against real hardware (no access from here), see README:
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -268,19 +269,41 @@ def _find_records(obj):
     return None
 
 
-def parse_price_records(data, tz=None):
-    """UNVERIFIED parser for the Sobry v2 JSON -> [(naive local datetime, price)].
+_HHMM = re.compile(r"^\d{2}:\d{2}(:\d{2})?$")
 
-    Finds the first list of objects that carry a time field and a price field.
-    If your response looks different (run `main.py --probe` and look at the
-    sample it prints), fix this one function.
+
+def _rec_time(rec, tk, tz):
+    """Slot start of one record, as naive local time."""
+    t = rec.get("time")
+    if "date" in rec and isinstance(t, str) and _HHMM.match(t):
+        # Sobry v2 (real sample): {"date": "2026-10-23", "time": "00:15", ...}
+        # Date and time are separate fields and are local wall-clock time.
+        return datetime.strptime("%s %s" % (rec["date"], t[:5]), "%Y-%m-%d %H:%M")
+    return _parse_time(rec[tk], tz)
+
+
+def _count_estimated(data):
+    recs = _find_records(data) or []
+    return sum(1 for r in recs if r.get("estimated") is True)
+
+
+def parse_price_records(data, tz=None):
+    """Sobry v2 JSON -> [(naive local datetime, price EUR/kWh)].
+
+    Verified on a real response (taxMode=ttc, granularity=15m), a list of
+        {"date": "2026-10-23", "time": "00:00", "color": "#EAECF0",
+         "colorLabel": "GREY", "price": 0.259944, "rawPriceAmount": 0.154,
+         "estimated": false}
+    where `price` is the all-in price (rawPriceAmount is the energy part).
+    Other layouts are handled in a generic way: the first list of objects
+    with a time field and a price field.
     """
     recs = _find_records(data)
     if not recs:
         raise ValueError("no price records found in API response")
     tk = _first_key(recs[0], _TIME_KEYS)
     pk = _first_key(recs[0], _PRICE_KEYS)
-    out = [(_parse_time(r[tk], tz), float(r[pk])) for r in recs]
+    out = [(_rec_time(r, tk, tz), float(r[pk])) for r in recs]
     out.sort()
     # A time field that does not identify the slot (e.g. a date without the
     # hour) would collapse all records onto one slot and leave the planner
@@ -298,6 +321,7 @@ class SobryPrices:
     def __init__(self, cfg):
         self.cfg = cfg
         self.tz = _zone(cfg.timezone)
+        self.provisional = False        # True while some prices are "estimated"
         self._key = os.environ.get("SOBRY_API_KEY")
         if not self._key:
             raise RuntimeError("set the SOBRY_API_KEY environment variable "
@@ -315,11 +339,19 @@ class SobryPrices:
     def curve(self):
         """Raw [(slot start, price)] for today and, once published, tomorrow."""
         today = datetime.now(self.tz).date() if self.tz else datetime.now().date()
-        out = parse_price_records(self.fetch_raw(today), self.tz)  # failure -> raises
+        raw = self.fetch_raw(today)                                 # failure -> raises
+        out = parse_price_records(raw, self.tz)
+        estimated = _count_estimated(raw)
         try:
-            out += parse_price_records(self.fetch_raw(today + timedelta(days=1)), self.tz)
+            raw = self.fetch_raw(today + timedelta(days=1))
+            out += parse_price_records(raw, self.tz)
+            estimated += _count_estimated(raw)
         except (urllib.error.HTTPError, ValueError) as exc:
             log.info("tomorrow's prices not available yet (%s)", exc)
+        self.provisional = estimated > 0
+        if estimated:
+            log.info("%d prices are marked 'estimated' by Sobry: they will be "
+                     "re-fetched more often until final", estimated)
         out.sort()
         return out
 
@@ -358,6 +390,10 @@ class HardwareIO:
 
     def get_price_curve(self):
         return self.prices.curve()
+
+    @property
+    def prices_provisional(self):
+        return self.prices.provisional
 
     def close(self):
         self.tic.close()

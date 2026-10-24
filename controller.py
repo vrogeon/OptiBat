@@ -229,7 +229,9 @@ class SmartController:
         horizon_end = slot_start + timedelta(minutes=self.sm * cfg.horizon_slots)
         covered = max(self.known_prices) if self.known_prices else None
         full = covered is not None and covered >= horizon_end - timedelta(minutes=self.sm)
-        every = cfg.price_refresh_full_min if full else cfg.price_refresh_min
+        provisional = getattr(self.io, "prices_provisional", False)  # "estimated" prices
+        every = (cfg.price_refresh_full_min if full and not provisional
+                 else cfg.price_refresh_min)
         if (self._price_fetch_at is not None and
                 (now - self._price_fetch_at).total_seconds() < every * 60):
             return False

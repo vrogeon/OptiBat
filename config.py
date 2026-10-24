@@ -63,7 +63,7 @@ class Config:
         "taxMode": "ttc", "granularity": "15m"})   # ttc = tax included (as in prices.py)
     timezone: str = "Europe/Paris"  # to convert timestamps that carry a UTC offset
     price_scale: float = 1.0        # multiply raw API value to get EUR/kWh
-                                    # (unit of the Sobry v2 response not verified: see --probe)
+                                    # (Sobry's `price` is already EUR/kWh: leave at 1.0)
     price_adder_eur_kwh: float = 0.0  # constant add-on (taxes, grid fees...)
     price_prior_eur_kwh: float = 0.20  # used until prices have been learned
     price_refresh_min: int = 60     # re-fetch while the horizon isn't covered
