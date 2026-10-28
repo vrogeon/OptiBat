@@ -79,6 +79,13 @@ class SmartController:
         self._last_sent = None
         self._last_sent_t = None
         self._cmd_retry_at = None
+        self._rt_reason = ""              # "plan" / "price": why the battery is active
+        self._fw_sum, self._fw_n, self._fw_at, self._fw_used = 0.0, 0, None, False
+        self._grid_w = 0.0                # last raw meter reading (for the logs)
+        self._mode = "idle"
+        self._mode_logged_at = None
+        self._status_at = None
+        self._st = [0, 0.0, 0.0, 0.0]     # n, grid, battery cmd, load sums since last STATUS
         self._price_fetch_at = None
         self._price_trained_until = None
         self._prices_dirty = False
@@ -132,7 +139,9 @@ class SmartController:
             self._replan(slot_start)
 
         self._account(grid_w, load_w, dt)
+        self._grid_w = grid_w
         self._apply(self._realtime_target(now, grid_w, load_w), now)
+        self._log_activity(now, grid_w, load_w)
         self._maybe_save(now)
 
     def shutdown(self):
@@ -299,15 +308,70 @@ class SmartController:
                  self.plan.cost_eur, self.plan.baseline_eur, self.plan.solve_ms)
 
     # --------------------------------------------------------------- real time
+    def _worth_discharging(self):
+        """Price now, net of losses and wear, vs. the value of keeping the energy.
+
+        The value of stored energy comes from the plan's cost-to-go at the
+        current SoC: it rises as the battery empties, so this switches off by
+        itself before the energy needed for better slots is touched.
+        """
+        cfg = self.cfg
+        if not cfg.value_based_discharge:
+            return False
+        lam = self.opt.marginal_value(self.plan, self.soc)
+        if lam is None:
+            return False
+        gain = self.plan.steps[0].price * cfg.eff_discharge - cfg.cycle_cost_eur_kwh
+        return gain > lam + cfg.value_margin_eur_kwh
+
+    def _follow(self, now, sp, grid_w):
+        """Adjust the discharge command from the meter, with smoothing.
+
+        The meter readings are averaged over `follow_interval_s` and the command
+        is changed only once per interval, and only if the average import is
+        off target by more than `deadband_w`. Acting on every raw reading made
+        the command chase every appliance cycle and the battery's own response
+        lag; one decision per interval also lets the previous command take effect
+        before the next one is judged.
+        """
+        cfg = self.cfg
+        self._fw_used = True
+        self._fw_sum += grid_w
+        self._fw_n += 1
+        if (self._fw_at is not None and
+                (now - self._fw_at).total_seconds() < cfg.follow_interval_s - 1e-6):
+            return sp                                        # hold the command
+        g = self._fw_sum / self._fw_n
+        self._fw_sum, self._fw_n, self._fw_at = 0.0, 0, now
+        if not self._signed() and g < 1.0:                   # meter at 0: over-covering
+            return sp - max(25.0, 0.5 * sp) if sp > 0.0 else sp
+        err = g - cfg.target_import_w
+        if abs(err) < cfg.deadband_w:
+            return sp
+        # from idle the meter shows the whole load: go straight to it
+        return sp + (1.0 if sp <= 0.0 else cfg.follow_gain) * err
+
     def _realtime_target(self, now, grid_w, load_w):
+        self._fw_used = False
+        target = self._target(now, grid_w, load_w)
+        if not self._fw_used:                  # not following the load: start afresh
+            self._fw_sum, self._fw_n, self._fw_at = 0.0, 0, None
+        return target
+
+    def _target(self, now, grid_w, load_w):
         cfg = self.cfg
         if self.plan is None:
             return 0.0
         s0 = self.plan.steps[0]
-        if s0.d == 0:
+        # Beyond the plan: if the price now (net of losses and wear) beats what
+        # the same energy is worth later, cover as much of the real consumption
+        # as possible, whatever the forecast said. Never in a charging slot.
+        worth = s0.d <= 0 and self._worth_discharging()
+        if s0.d == 0 and not worth:
             return 0.0
 
         if s0.d > 0:                                          # ---- charge
+            self._rt_reason = "plan"
             if self.soc >= cfg.soc_max:
                 return 0.0
             budget = s0.energy_ac_wh * cfg.charge_budget_factor - self._slot_charged_wh
@@ -319,17 +383,16 @@ class SmartController:
             room = cfg.max_grid_w - cfg.grid_margin_w - load_w
             return -max(0.0, min(want, cfg.max_charge_w, room))
 
-        # ---- discharge: follow the load, within the slot's energy budget
+        # ---- discharge: follow the load. Inside the plan's energy budget, or
+        # without budget while discharging is worth more than keeping the energy.
         if self.soc <= cfg.soc_min:
             return 0.0
         budget = s0.energy_ac_wh * cfg.discharge_budget_factor - self._slot_discharged_wh
-        if budget <= 0.0:
+        in_plan = s0.d < 0 and budget > 0.0
+        if not in_plan and not worth:
             return 0.0
-        sp = self.setpoint if self.setpoint > 0 else 0.0
-        if self._signed() or grid_w >= 1.0:
-            sp += cfg.follow_gain * (grid_w - cfg.target_import_w)
-        else:                                                # meter at 0: back off fast
-            sp -= max(25.0, 0.25 * sp)
+        self._rt_reason = "plan" if in_plan else "price"
+        sp = self._follow(now, self.setpoint if self.setpoint > 0 else 0.0, grid_w)
         return min(max(sp, 0.0), cfg.max_discharge_w)
 
     def _apply(self, target_w, now):
@@ -350,9 +413,49 @@ class SmartController:
             self._cmd_retry_at = now + timedelta(seconds=10)
             return
         self._cmd_retry_at = None
+        if cfg.log_commands and sp != self._last_sent:
+            log.info("CMD%s %+d W (was %+d W) | %s | grid %.0f W load %.0f W soc %.0f%% "
+                     "price %.3f", " [dry-run]" if getattr(self.io, "dry_run", False) else "",
+                     sp, self._last_sent or 0, self._rt_reason or "-", self._grid_w,
+                     self._load_w, self.soc * 100, self._slot_price)
         self._last_sent = sp
         self._last_sent_t = now
         self.setpoint = float(sp)
+
+    # ----------------------------------------------------------------- activity log
+    def _log_activity(self, now, grid_w, load_w):
+        """ACTION on every change idle/charge/discharge, STATUS once per minute."""
+        cfg = self.cfg
+        st = self._st
+        st[0] += 1
+        st[1] += grid_w
+        st[2] += self.setpoint
+        st[3] += load_w
+        dry = " [dry-run]" if getattr(self.io, "dry_run", False) else ""
+        s0 = self.plan.steps[0] if self.plan else None
+
+        mode = "charge" if self.setpoint < 0 else "discharge" if self.setpoint > 0 else "idle"
+        if mode != self._mode and (self._mode_logged_at is None or
+                                   (now - self._mode_logged_at).total_seconds() >= 15.0):
+            log.info("ACTION%s %s -> %s %.0f W (%s) | price %.3f soc %.0f%% load %.0f W "
+                     "grid %.0f W", dry, self._mode, mode, abs(self.setpoint),
+                     self._rt_reason or "-", self._slot_price, self.soc * 100,
+                     load_w, grid_w)
+            self._mode, self._mode_logged_at = mode, now
+
+        if not cfg.log_status_s:
+            return
+        if self._status_at is None:
+            self._status_at = now
+        elif (now - self._status_at).total_seconds() >= cfg.log_status_s and st[0]:
+            t = self.totals
+            plan = ("charge" if s0.d > 0 else "discharge" if s0.d < 0 else "idle") if s0 else "-"
+            log.info("STATUS%s plan=%s | battery cmd %+.0f W | grid %.0f W | load %.0f W | "
+                     "price %.3f | soc %.0f%% | saved %.2f EUR since start", dry, plan,
+                     st[2] / st[0], st[1] / st[0], st[3] / st[0], self._slot_price,
+                     self.soc * 100, t["baseline"] - t["cost"] - t["wear"])
+            self._status_at = now
+            self._st = [0, 0.0, 0.0, 0.0]
 
     # ------------------------------------------------------------- persistence
     def _maybe_save(self, now):

@@ -36,6 +36,8 @@ class Plan:
     cost_eur: float      # planned cost over the horizon
     baseline_eur: float  # same horizon without battery
     solve_ms: float
+    value_after: list = None  # cost-to-go per SoC index at the END of the first
+                              # slot: tells what stored energy is worth later
 
 
 class Optimizer:
@@ -95,8 +97,11 @@ class Optimizer:
         # value of the energy left in the battery when the horizon ends
         V = [terminal_value * i * self.step_kwh * cfg.eff_discharge for i in range(S)]
         policy = [None] * N
+        value_after = V
 
         for t in range(N - 1, -1, -1):
+            if t == 0:
+                value_after = V               # cost-to-go at the start of slot 1
             p = prices[t]
             load = loads_kwh[t]
             best = [INF] * S
@@ -136,4 +141,16 @@ class Optimizer:
                 price=prices[t],
                 load_w=loads_kwh[t] / self.dt_h * 1000.0,
                 cost_eur=cost))
-        return Plan(steps, total, base, (time.perf_counter() - t_start) * 1000.0)
+        return Plan(steps, total, base, (time.perf_counter() - t_start) * 1000.0,
+                    value_after)
+
+    def marginal_value(self, plan, soc):
+        """EUR gained later per kWh (battery side) of energy kept at `soc`.
+
+        The slope of the cost-to-go: if the price now (net of losses and wear)
+        is above it, using the energy now beats keeping it for later.
+        """
+        if plan.value_after is None:
+            return None
+        s = max(1, self.index_of(soc))
+        return (plan.value_after[s - 1] - plan.value_after[s]) / self.step_kwh

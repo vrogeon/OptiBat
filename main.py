@@ -10,6 +10,7 @@ Usage:
 """
 import logging
 import signal
+from logging.handlers import RotatingFileHandler
 import sys
 import time
 from datetime import datetime
@@ -35,13 +36,26 @@ class DryRunIO:
         logging.getLogger("smart").debug("DRY RUN: battery command %d W", watts)
 
 
-def main():
-    logging.basicConfig(level=logging.INFO,
+def setup_logging(cfg):
+    """Console + rotating log file (cfg.log_path, None = console only)."""
+    handlers = [logging.StreamHandler()]
+    if cfg.log_path:
+        try:
+            handlers.append(RotatingFileHandler(
+                cfg.log_path, maxBytes=cfg.log_max_bytes,
+                backupCount=cfg.log_backups, encoding="utf-8"))
+        except OSError as exc:        # unwritable folder: keep running on the console
+            print("WARNING: cannot write the log file %s: %s" % (cfg.log_path, exc),
+                  file=sys.stderr)
+    logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(message)s")
-    log = logging.getLogger("smart")
 
+
+def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     cfg = Config.from_file(args[0]) if args else Config()
+    setup_logging(cfg)
+    log = logging.getLogger("smart")
 
     if "--probe" in sys.argv:
         adapters.probe(cfg)

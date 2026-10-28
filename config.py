@@ -12,7 +12,14 @@ Conventions used everywhere in the code base
                             Europe/Paris with `sudo raspi-config`).
 """
 import json
+import sys
 from dataclasses import dataclass, field, fields
+
+
+def default_tic_port():
+    """Serial port of the Linky TIC: COM5 on Windows, /dev/serial0 elsewhere
+    (Raspberry Pi). Override with "tic_port" in the JSON config if yours differs."""
+    return "COM5" if sys.platform.startswith("win") else "/dev/serial0"
 
 
 @dataclass
@@ -47,8 +54,9 @@ class Config:
     zendure_timeout_s: float = 3.0
 
     # ---- Linky TIC, standard mode (from your gateway.py) -----------------------
-    tic_port: str = "COM5"  # gateway.py has "COM5" (Windows); on the Pi use
-                                    # /dev/serial0, /dev/ttyAMA0 or /dev/ttyUSB0
+    tic_port: str = field(default_factory=default_tic_port)
+                                    # auto: "COM5" on Windows, "/dev/serial0" on the Pi.
+                                    # Other Pi ports: /dev/ttyAMA0, /dev/ttyUSB0
     tic_baud: int = 9600
     tic_max_age_s: float = 10.0     # older SINSTS = "no data" -> fail-safe
 
@@ -81,19 +89,32 @@ class Config:
     # ---- real-time control ------------------------------------------------------
     control_period_s: float = 2.0   # the battery's HTTP API reacts in seconds: a 1 s
                                     # loop would only chase its own commands
-    follow_gain: float = 0.4        # fraction of the grid-import error corrected per tick
-                                    # (tune on the real device: lower if it oscillates)
+    follow_gain: float = 0.55       # fraction of the (averaged) import error corrected
+                                    # per adjustment (tune on the real device)
+    follow_interval_s: float = 6.0  # the meter is averaged over this time and the
+                                    # discharge command changes at most once per interval
+                                    # (0 = react to every reading)
+    deadband_w: float = 25.0        # ignore an average import error smaller than this
     target_import_w: float = 30.0   # keep this much import so we never export
     min_change_w: float = 10.0      # don't re-send the setpoint for smaller changes
     command_refresh_s: float = 30.0  # re-send the setpoint at least this often
     discharge_budget_factor: float = 1.15  # allow 15 % above planned energy / slot
+    value_based_discharge: bool = True  # beyond that budget (and in slots planned idle),
+                                        # keep covering the real consumption while the
+                                        # price now beats the value of keeping the energy
+    value_margin_eur_kwh: float = 0.01  # ... by at least this margin (avoids flapping)
     charge_budget_factor: float = 1.02
     stale_s: float = 15.0           # no grid reading for this long -> battery idle
     soc_poll_s: float = 10.0        # how often to ask the battery for its SoC
 
-    # ---- persistence ------------------------------------------------------------
+    # ---- persistence and logs (relative paths: from the working directory) -------
     state_path: str = "state.json"  # None disables persistence
     save_every_s: float = 1800.0    # SD-card friendly
+    log_path: str = "smart_battery.log"  # None = console only
+    log_max_bytes: int = 1_000_000  # rotation: keeps log_backups files of this size
+    log_backups: int = 5            # (~1 MB is a few weeks at one STATUS line per minute)
+    log_status_s: float = 60.0      # STATUS line every N seconds (0 = off)
+    log_commands: bool = True       # one CMD line for every change of the battery command
 
     def __post_init__(self):
         if (self.slot_minutes != 15
